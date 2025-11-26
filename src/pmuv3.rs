@@ -71,3 +71,38 @@ impl PmuEventCounter {
 pub fn cpu_cycle_count() -> u64 {
     mrs!(PMCCNTR_EL0)
 }
+
+pub struct PmuManager {
+    event_counters_num: AtomicUsize,
+    // event_counters_list: Mutex<Vec<PmuEventCounter>>,
+}
+
+impl PmuManager {
+    pub fn new() -> Self {
+        let counter_list = PmuManager {
+            event_counters_num: AtomicUsize::new(0),
+            // event_counters_list: Mutex::new(Vec::new()),
+        };
+        // enable Long cycle count, disable Clock divider
+        PMCR_EL0.modify(PMCR_EL0::LC::Enable + PMCR_EL0::D::Disable);
+
+        // reset Clock counter and event counter
+        PMCR_EL0.modify(PMCR_EL0::P::Reset + PMCR_EL0::C::Reset);
+
+        // enable PMU
+        PMCR_EL0.modify(PMCR_EL0::E::Enable);
+
+        // enables the cycle counter
+        msr!(PMCNTENSET_EL0, 1u64 << 31);
+
+        // only count EL0 and EL1, don't count EL2
+        PMCCFILTR_EL0.write(
+            PMCCFILTR_EL0::P::Count + PMCCFILTR_EL0::U::Count + PMCCFILTR_EL0::NSH::DontCount,
+        );
+
+        // software can access PMCCNTR_EL0
+        PMUSERENR_EL0.write(PMUSERENR_EL0::EN::Trap + PMUSERENR_EL0::CR::Trap);
+
+        counter_list
+    }
+}
