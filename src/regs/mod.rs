@@ -21,15 +21,15 @@ macro_rules! define_pmu_register {
             pub struct Reg;
 
             impl Readable for Reg {
-                type T = u64;
                 type R = ();
+                type T = u64;
 
                 sys_coproc_read_raw!(u64, $reg_literal, "x");
             }
 
             impl Writeable for Reg {
-                type T = u64;
                 type R = ();
+                type T = u64;
 
                 sys_coproc_write_raw!(u64, $reg_literal, "x");
             }

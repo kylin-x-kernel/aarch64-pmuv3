@@ -95,8 +95,8 @@ register_bitfields! {u64,
 pub struct Reg;
 
 impl Readable for Reg {
-    type T = u64;
     type R = PMCR_EL0::Register;
+    type T = u64;
 
     #[inline]
     fn get(&self) -> Self::T {
@@ -107,8 +107,8 @@ impl Readable for Reg {
 }
 
 impl Writeable for Reg {
-    type T = u64;
     type R = PMCR_EL0::Register;
+    type T = u64;
 
     #[inline]
     fn set(&self, value: Self::T) {

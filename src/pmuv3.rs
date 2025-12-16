@@ -1,116 +1,219 @@
-use core::sync::atomic::{AtomicUsize, Ordering};
-
-use tock_registers::interfaces::{ReadWriteable, Readable, Writeable};
+//! PMU Counter Configuration Module
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::{isb, mrs, msr};
-pub const MAX_EVCNT: usize = 31;
-use super::regs::{PMCCFILTR_EL0, PMCR_EL0, PMUSERENR_EL0};
+
+/// PMU overflow interrupt number (typically PPI 23, so INTID 23).
+pub const PMU_OVERFLOW_IRQ: u32 = 23;
 
 /// See ARM PMU Events
+///
+/// todo: more event to support
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 #[repr(u32)]
-enum PmuEvent {
-    MemAccess = 0x13,      // Data memory access
-    L2dCache = 0x16,       // Level 2 data cache access
+pub enum PmuEvent {
+    CpuCycles      = 0x11, // Cpu Cycles counter
+    MemAccess      = 0x13, // Data memory access
+    L2dCache       = 0x16, // Level 2 data cache access
     L2dCacheRefill = 0x17, // Level 2 data cache refill
 }
 
-#[derive(Clone, Debug)]
-pub struct PmuEventCounter {
-    event: PmuEvent,
-    index: u32,
+/// Error type for PMU operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PmuError {
+    /// PMU not available on this platform.
+    NotAvailable,
+    /// Invalid counter index.
+    InvalidCounter,
+    /// Counter already in use.
+    CounterInUse,
+    /// Operation failed.
+    Failed,
 }
 
-impl PmuEventCounter {
-    fn enable(&self, initial_value: u32) {
-        // Disable counter
-        msr!(PMCNTENCLR_EL0, 1u64 << self.index);
+/// PMU Counter configuration.
+pub struct PmuCounter {
+    /// Counter index to use (0-30 for event counters, 31 for cycle counter).
+    counter_index: u32,
+    /// Threshold value - interrupt triggers when counter reaches this.
+    threshold: u64,
+    /// Whether the NMI source is enabled.
+    enabled: AtomicBool,
 
-        // Clear overflows
-        msr!(PMOVSCLR_EL0, 1u64 << self.index);
+    event: Option<PmuEvent>,
+}
 
-        self.set_counter(initial_value);
+impl PmuCounter {
+    /// Create a new cycle counter (counter 31).
+    ///
+    /// # Arguments
+    /// * `threshold` - Counter value at which to trigger interrupt.
+    ///                 For cycle counter, this is CPU cycles.
+    pub const fn new_cycle_counter(threshold: u64) -> Self {
+        Self {
+            counter_index: 31,
+            threshold,
+            enabled: AtomicBool::new(false),
+            event: None,
+        }
+    }
 
-        // Enable interrupt for this counter
-        msr!(PMINTENSET_EL1, 1u64 << self.index);
+    /// Create a new event counter.
+    ///
+    /// # Arguments
+    /// * `counter_index` - Event counter index (0-30)
+    /// * `event` - PMU event type to count
+    /// * `threshold` - Counter value at which to trigger interrupt
+    pub const fn new_event_counter(counter_index: u32, threshold: u64, event: PmuEvent) -> Self {
+        Self {
+            counter_index,
+            threshold,
+            enabled: AtomicBool::new(false),
+            event: Some(event),
+        }
+    }
+
+    /// Get the counter index.
+    pub fn counter_index(&self) -> u32 {
+        self.counter_index
+    }
+
+    /// Get the threshold value.
+    pub fn threshold(&self) -> u64 {
+        self.threshold
+    }
+
+    /// Set a new threshold value.
+    pub fn set_threshold(&mut self, threshold: u64) {
+        self.threshold = threshold;
+    }
+
+    /// Check pmu support.
+    pub fn check_pmu_support(&self) -> Result<(), PmuError> {
+        // Read PMU version from ID_AA64DFR0_EL1
+        let aa64dfr0: u64 = mrs!(ID_AA64DFR0_EL1);
+        let pmu_ver = (aa64dfr0 >> 8) & 0xF;
+
+        // Check pmu version
+        if pmu_ver == 0 || pmu_ver == 0xF {
+            return Err(PmuError::NotAvailable);
+        }
+
+        // Read number of counters from PMCR_EL0
+        let pmcr: u64 = mrs!(PMCR_EL0);
+        let num_counters = ((pmcr >> 11) & 0x1F) as u32;
+
+        // Validate counter index
+        if self.counter_index < 31 && self.counter_index >= num_counters {
+            return Err(PmuError::InvalidCounter);
+        }
+        Ok(())
+    }
+
+    /// Enable the PMU Counter.
+    ///
+    /// This starts the counter and enables overflow interrupt.
+    pub fn enable(&self) -> Result<(), PmuError> {
+        // Enable overflow interrupt
+        msr!(PMINTENSET_EL1, 1u64 << self.counter_index);
 
         // Enable counter
-        msr!(PMCNTENSET_EL0, 1u64 << self.index);
+        msr!(PMCNTENSET_EL0, 1u64 << self.counter_index);
+
+        // Ensure PMU is enabled
+        let pmcr: u64 = mrs!(PMCR_EL0);
+        msr!(PMCR_EL0, pmcr | (1 << 0) | (1 << 1) | (1 << 2)); // Set E, P, and U bits
+
+        // Clear any pending overflow
+        msr!(PMOVSCLR_EL0, 1u64 << 31);
+
+        // NSH=0 (count EL2), P=1 (count EL1), U=1 (count EL0), NSK=0, M=0
+        let filter: u64 = (1 << 31) | (1 << 30); // P and U bits
+        msr!(PMCCFILTR_EL0, filter);
+
+        // If event counter, select event type
+        if let Some(event) = self.event {
+            msr!(PMSELR_EL0, self.counter_index, "x");
+            msr!(PMXEVTYPER_EL0, event as u32, "x");
+        }
+        self.set_counter();
+
+        self.enabled.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Disable the PMU Counter.
+    pub fn disable(&self) -> Result<(), PmuError> {
+        self.enabled.store(false, Ordering::Release);
+
+        // Disable counter
+        msr!(PMCNTENCLR_EL0, 1u64 << self.counter_index);
+        // Disable overflow interrupt
+        msr!(PMINTENCLR_EL1, 1u64 << self.counter_index);
+
+        isb!();
+        Ok(())
+    }
+
+    /// Set the counter value.
+    pub fn set_counter(&self) {
+        if self.counter_index == 31 {
+            // Set cycle counter to (MAX - threshold) so it overflows after `threshold` cycles
+            let initial_value = u64::MAX - self.threshold;
+            msr!(PMCCNTR_EL0, initial_value);
+        } else {
+            // For event counters, set to (MAX_U32 - threshold)
+            let initial_value = (u32::MAX as u64) - (self.threshold & 0xFFFFFFFF);
+            msr!(PMXEVCNTR_EL0, initial_value as u32, "x");
+        }
         isb!();
     }
 
-    fn disable(&self) {
-        // Disable counter
-        msr!(PMCNTENCLR_EL0, 1u64 << self.index);
+    /// Check if overflow occurred and clear the flag.
+    ///
+    /// Returns true if overflow was detected (and cleared).
+    /// This should be called from the interrupt handler.
+    pub fn check_and_clear_overflow(&self) -> bool {
+        let mask = if self.counter_index == 31 {
+            1u64 << 31
+        } else {
+            1u64 << self.counter_index
+        };
 
-        // Disbale interrupt for this counter
-        msr!(PMINTENCLR_EL1, 1u64 << self.index);
+        // Read overflow status
+        let overflow: u64 = mrs!(PMOVSSET_EL0);
 
-        // Reset the event conuter to 0
-        self.set_counter(0);
+        if (overflow & mask) != 0 {
+            // Clear overflow flag
+            msr!(PMOVSCLR_EL0, mask);
+            isb!();
+            true
+        } else {
+            false
+        }
     }
 
-    fn set_counter(&self, initial_value: u32) {
-        // Select event counter
-        msr!(PMSELR_EL0, self.index, "x");
-        // Set event type
-        msr!(PMXEVTYPER_EL0, self.event as u32, "x");
-        // Set event conuter initial value
-        msr!(PMXEVCNTR_EL0, initial_value, "x");
+    /// Handle PMU overflow interrupt.
+    ///
+    /// Call this from your interrupt handler. Returns true if this was
+    /// a PMU overflow that was handled.
+    pub fn handle_overflow(&self) -> bool {
+        if !self.enabled.load(Ordering::Acquire) {
+            return false;
+        }
+
+        if self.check_and_clear_overflow() {
+            // Reset counter for next period
+            self.set_counter();
+            true
+        } else {
+            false
+        }
     }
 
-    fn read_counter(&self) -> u32 {
-        // Select event counter
-        msr!(PMSELR_EL0, self.index, "x");
-        mrs!(PMXEVCNTR_EL0) as u32
+    /// Check if the NMI source is currently enabled.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Acquire)
     }
-}
-
-#[allow(dead_code)]
-pub fn cpu_cycle_count() -> u64 {
-    mrs!(PMCCNTR_EL0)
-}
-
-#[repr(C)]
-#[derive(Default, Debug)]
-pub struct PmuRegister {
-    pub pmcr_el0: u64,
-    pub pmccfiltr_el0: u64,
-    pub pmccntr_el0: u64,
-    pub pmcntenset_el0: u64,
-    pub pmcntenclr_el0: u64,
-    pub pmintenset_el1: u64,
-    pub pmintenclr_el1: u64,
-    pub pmovsset_el0: u64,
-    pub pmovsclr_el0: u64,
-    pub pmselr_el0: u64,
-    pub pmuserenr_el0: u64,
-    pub pmxevcntr_el0: u64,
-    pub pmxevtyper_el0: u64,
-    pub pmevcntr_el0: [u64; MAX_EVCNT],
-    pub pmevtyper_el0: [u64; MAX_EVCNT],
-}
-
-pub fn init_pmu(_threshold : usize) -> Result<(), &'static str> {
-    // enable Long cycle count, disable Clock divider
-    PMCR_EL0.modify(PMCR_EL0::LC::Enable + PMCR_EL0::D::Disable);
-
-    // reset Clock counter and event counter
-    PMCR_EL0.modify(PMCR_EL0::P::Reset + PMCR_EL0::C::Reset);
-
-    // enable PMU
-    PMCR_EL0.modify(PMCR_EL0::E::Enable);
-
-    // enables the cycle counter
-    msr!(PMCNTENSET_EL0, 1u64 << 31);
-
-    // only count EL0 and EL1, don't count EL2
-    PMCCFILTR_EL0
-        .write(PMCCFILTR_EL0::P::Count + PMCCFILTR_EL0::U::Count + PMCCFILTR_EL0::NSH::DontCount);
-
-    // software can access PMCCNTR_EL0
-    PMUSERENR_EL0.write(PMUSERENR_EL0::EN::Trap + PMUSERENR_EL0::CR::Trap);
-
-    Ok(())
 }
