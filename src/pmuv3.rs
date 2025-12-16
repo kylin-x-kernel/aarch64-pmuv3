@@ -123,14 +123,12 @@ impl PmuCounter {
 
         // Ensure PMU is enabled
         let pmcr: u64 = mrs!(PMCR_EL0);
-        msr!(PMCR_EL0, pmcr | (1 << 0) | (1 << 1) | (1 << 2)); // Set E, P, and U bits
+        msr!(PMCR_EL0, pmcr | (1 << 0) | (1 << 1) | (1 << 2) | (1 << 6)); // Set E, P, U and LC bits
 
         // Clear any pending overflow
         msr!(PMOVSCLR_EL0, 1u64 << 31);
 
-        // NSH=0 (count EL2), P=1 (count EL1), U=1 (count EL0), NSK=0, M=0
-        let filter: u64 = (1 << 31) | (1 << 30); // P and U bits
-        msr!(PMCCFILTR_EL0, filter);
+        msr!(PMCCFILTR_EL0, 0u64, "x");
 
         // If event counter, select event type
         if let Some(event) = self.event {
