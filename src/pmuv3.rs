@@ -26,8 +26,10 @@ pub enum PmuError {
     NotAvailable,
     /// Invalid counter index.
     InvalidCounter,
-    /// Counter already in use.
-    CounterInUse,
+    /// Overflow not happended.
+    NoOverflow,
+    /// PMU not enabled.
+    NotEnabled,
     /// Operation failed.
     Failed,
 }
@@ -114,7 +116,7 @@ impl PmuCounter {
     /// Enable the PMU Counter.
     ///
     /// This starts the counter and enables overflow interrupt.
-    pub fn enable(&self) -> Result<(), PmuError> {
+    pub fn enable(&self){
         // Enable overflow interrupt
         msr!(PMINTENSET_EL1, 1u64 << self.counter_index);
 
@@ -138,11 +140,10 @@ impl PmuCounter {
         self.set_counter();
 
         self.enabled.store(true, Ordering::Release);
-        Ok(())
     }
 
     /// Disable the PMU Counter.
-    pub fn disable(&self) -> Result<(), PmuError> {
+    pub fn disable(&self){
         self.enabled.store(false, Ordering::Release);
 
         // Disable counter
@@ -151,7 +152,6 @@ impl PmuCounter {
         msr!(PMINTENCLR_EL1, 1u64 << self.counter_index);
 
         isb!();
-        Ok(())
     }
 
     /// Set the counter value.
@@ -172,7 +172,7 @@ impl PmuCounter {
     ///
     /// Returns true if overflow was detected (and cleared).
     /// This should be called from the interrupt handler.
-    pub fn check_and_clear_overflow(&self) -> bool {
+    pub fn check_and_clear_overflow(&self) -> Result<(), PmuError> {
         let mask = if self.counter_index == 31 {
             1u64 << 31
         } else {
@@ -186,9 +186,9 @@ impl PmuCounter {
             // Clear overflow flag
             msr!(PMOVSCLR_EL0, mask);
             isb!();
-            true
+            Ok(())
         } else {
-            false
+            Err(PmuError::NoOverflow)
         }
     }
 
@@ -196,18 +196,14 @@ impl PmuCounter {
     ///
     /// Call this from your interrupt handler. Returns true if this was
     /// a PMU overflow that was handled.
-    pub fn handle_overflow(&self) -> bool {
+    pub fn handle_overflow(&self) -> Result<(), PmuError> {
         if !self.enabled.load(Ordering::Acquire) {
-            return false;
+            return Err(PmuError::NotEnabled);
         }
 
-        if self.check_and_clear_overflow() {
-            // Reset counter for next period
-            self.set_counter();
-            true
-        } else {
-            false
-        }
+        self.check_and_clear_overflow()?;
+        self.set_counter();
+        Ok(())
     }
 
     /// Check if the NMI source is currently enabled.
